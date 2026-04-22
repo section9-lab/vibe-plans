@@ -1,472 +1,717 @@
 #!/usr/bin/env bash
 
-# ============================================================
-# VibePlans: ExecPlan + Brainstorming Setup Script
-# ============================================================
-# 兼容工具及配置文件:
-# - Codex CLI    → AGENTS.md, .agent/AGENTS.md
-# - Claude Code  → CLAUDE.md
-# - Copilot-CLI  → AGENTS.md
-# - OpenCode     → AGENTS.md
-#
-# 用法: ./execplan-setup.sh [codex|claude|copilot|opencode]
-#        默认: codex
-# ============================================================
-
 set -euo pipefail
 
-# --- 常量 ---
-MARKER="Brainstorming Ideas Into Designs"
-PLAN_MARKER="Codex Execution Plans (ExecPlans) with Brainstorming"
+SCRIPT_NAME="$(basename "$0")"
+PROJECT_NAME="open-exec-plans"
+MANAGED_MARKER="open-exec-plans:managed"
+BRIDGE_MARKER="open-exec-plans:bridge"
 
-AGENT_DIR=".agent"
-PLAN_FILE="$AGENT_DIR/PLANS.md"
+DRY_RUN=0
+FORCE_MANAGED=0
+PRINT_PROFILE=0
+INSTALL_ALL=0
 
-# 各工具的配置文件（按优先级排序）
-# 使用关联数组，兼容 bash 4+
-get_tool_files() {
-  local tool="$1"
-  case "$tool" in
-    codex)    echo "AGENTS.md .agent/AGENTS.md" ;;
-    claude)  echo "CLAUDE.md" ;;
-    copilot) echo "AGENTS.md" ;;
-    opencode) echo "AGENTS.md" ;;
-    *)       echo "AGENTS.md" ;;
-  esac
+ALL_TOOLS=(codex claude gemini opencode copilot)
+REQUESTED_TOOLS=()
+
+CREATED_FILES=()
+UPDATED_FILES=()
+APPENDED_FILES=()
+SKIPPED_FILES=()
+WARNINGS=()
+
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME [options] [tool ...]
+
+OpenExecPlans installs an ExecPlan-first workflow into the current repository.
+It always ensures the canonical source exists.
+
+Default behavior:
+  Running without tool arguments installs bridges for all supported tools.
+  Passing one or more tool names installs only those tool bridges.
+
+Options:
+  --tool <list>         Comma-separated tools: codex, claude, gemini, opencode, copilot
+  --all                 Install bridges for all supported tools (same as default)
+  --dry-run             Show planned file operations without writing files
+  --force-managed       Overwrite managed bridge/config files that do not support in-file markers
+  --print-profile       Print the selected tools and target files before applying changes
+  -h, --help            Show this help text
+
+Legacy shorthand:
+  $SCRIPT_NAME claude
+  $SCRIPT_NAME codex opencode
+
+Examples:
+  $SCRIPT_NAME
+  $SCRIPT_NAME claude
+  $SCRIPT_NAME --tool claude,gemini
+  $SCRIPT_NAME --all --dry-run
+EOF
 }
 
-# 核心内容片段（所有工具共用）
-INTRO_CONTENT='Brainstorming Ideas Into Designs.
-Help turn ideas into fully formed designs and specs through natural collaborative dialogue.
-Start by understanding the current project context, then ask questions one at a time to refine the idea.
-Once you understand what you are building, present the design and get user approval.
-Do NOT invoke any implementation skill, write any code, scaffold any project, or take any implementation action until you have presented a design and the user has approved it.
-This applies to EVERY project regardless of perceived simplicity.'
-
-EXECPLAN_CONTENT="After the design is explicitly approved by the user, you may:
-- Create or update an ExecPlan document that the coding agent can follow.
-- Use the milestones, logs, and validation steps described in .agent/PLANS.md.
-- Implement the plan autonomously without asking for \"next steps\" at every stage."
-
-# --- 函数 ---
-usage() {
-  cat << EOF
-用法: $0 [选项]
-
-选项:
-  --tool <codex|claude|copilot|opencode>  指定目标工具 (默认: codex)
-  -h, --help                                    显示帮助
-
-示例:
-  $0 --tool claude
-  $0 codex
-EOF
-  exit 0
+timestamp() {
+  date '+%H:%M:%S'
 }
 
 log() {
-  echo "[$(date '+%H:%M:%S')] $*"
+  printf '[%s] %s\n' "$(timestamp)" "$*"
 }
 
-has_marker() {
-  local file="$1"
-  grep -q "$MARKER" "$file" 2>/dev/null
+warn() {
+  WARNINGS+=("$*")
+  printf '[%s] warning: %s\n' "$(timestamp)" "$*" >&2
 }
 
-# 检查是否应该替换文件（文件被覆盖/简化的情况）
-should_replace() {
-  local file="$1"
-  # 如果文件为空，或只有空行/简单标题，认为是被覆盖了
-  local lines
-  lines=$(wc -l < "$file" 2>/dev/null || echo "0")
-  [[ "$lines" -le 3 ]]
+contains() {
+  local needle="$1"
+  shift
+  local item
+  for item in "$@"; do
+    if [[ "$item" == "$needle" ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
-ensure_dir() {
-  mkdir -p "$1"
-}
-
-# 追加内容到文件（检测重复）
-append_if_missing() {
-  local file="$1"
-  local section="$2"
-  local marker="$3"
-
-  if [[ ! -f "$file" ]]; then
-    cat > "$file"
-    log "创建: $file"
-    return
+append_unique_tool() {
+  local tool="$1"
+  if [[ "${#REQUESTED_TOOLS[@]}" -eq 0 ]] || ! contains "$tool" "${REQUESTED_TOOLS[@]}"; then
+    REQUESTED_TOOLS+=("$tool")
   fi
+}
 
-  if has_marker "$file"; then
-    log "跳过: $file (已包含 Brainstorming)"
-    return
+validate_tool() {
+  local tool="$1"
+  if contains "$tool" "${ALL_TOOLS[@]}"; then
+    return 0
   fi
-
-  cat >> "$file" << 'SECTION'
-
----
-
-SECTION
-  echo "$section" >> "$file"
-  log "追加: $file"
+  echo "Unsupported tool: $tool" >&2
+  usage
+  exit 1
 }
 
-# 创建 PLANS.md 模板
-create_plan_template() {
-  ensure_dir "$AGENT_DIR"
-
-  cat > "$PLAN_FILE" << 'PLANEOF'
-# Codex Execution Plans (ExecPlans) with Brainstorming
-
-This document describes the requirements for an execution plan ("ExecPlan"), a design document that a coding agent can follow to deliver a working feature or system change. Treat the reader as a complete beginner to this repository: they have only the current working tree and the single ExecPlan file you provide. There is no memory of prior plans and no external context.
-
-## 0. Brainstorming Ideas Into Designs (Required Pre‑ExecPlan Phase)
-
-Brainstorming Ideas Into Designs.
-Help turn ideas into fully formed designs and specs through natural collaborative dialogue.
-Start by understanding the current project context, then ask questions one at a time to refine the idea.
-Once you understand what you are building, present the design and get user approval.
-Do NOT invoke any implementation skill, write any code, scaffold any project, or take any implementation action until you have presented a design and the user has approved it.
-This applies to EVERY project regardless of perceived simplicity.
-
-Before you create or modify an ExecPlan, you MUST:
-
-1. Explore the current project context (files, docs, recent changes).
-2. Ask clarifying questions one at a time until the goal and constraints are clear.
-3. Propose one or more design options and get explicit user approval of the chosen design.
-4. Only after approval, proceed to author or update the ExecPlan described below.
-
-## 1. How to Use ExecPlans and This PLANS.md
-
-This ExecPlan is a **living document**. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
-
-When authoring an executable specification (ExecPlan), follow this PLANS.md _to the letter_. If it is not in your context, refresh your memory by reading the entire PLANS.md file. Be thorough in reading (and re‑reading) source material to produce an accurate specification. When creating a spec, start from the skeleton and flesh it out as you do your research.
-
-When implementing an executable specification (ExecPlan), do not prompt the user for "next steps"; simply proceed to the next milestone. Keep all sections up to date, add or split entries in the list at every stopping point to affirmatively state the progress made and next steps. Resolve ambiguities autonomously, and commit frequently.
-
-When discussing an executable specification (ExecPlan), record decisions in a log in the spec for posterity; it should be unambiguously clear why any change to the specification was made. ExecPlans are living documents, and it should always be possible to restart from _only_ the ExecPlan and no other work.
-
-When researching a design with challenging requirements or significant unknowns, use milestones to implement proof of concepts, "toy implementations", etc., that allow validating whether the user's proposal is feasible. Read the source code of libraries by finding or acquiring them, research deeply, and include prototypes to guide a fuller implementation.
-
-## 2. Non‑Negotiable Requirements
-
-Every ExecPlan MUST satisfy all of the following:
-
-1. **Self‑contained**: Contains everything a novice needs to succeed. Do not point to external blogs or docs; embed knowledge directly in the plan.
-2. **Living document**: Must be revised as progress is made, discoveries occur, and design decisions are made.
-3. **Novice‑guiding**: A complete newcomer to the codebase must be able to implement the feature end‑to‑end.
-4. **Outcome‑focused**: Must produce demonstrably valid behavior, not just code changes that satisfy definitions.
-5. **Defined terms**: Every non‑obvious term must be defined in plain language.
-
-**Format rules**:
-- The entire ExecPlan must be enclosed in a single ```md code block.
-- No nested triple backticks inside.
-- Use indentation for commands, diffs, and code snippets.
-- Two blank lines after headings.
-- Prefer sentences over bullet points. Bullet lists are only allowed in the Progress section.
-- Use specific and minimal descriptions.
-
-## 3. ExecPlan Skeleton
-
-Fill in every section completely. Follow the format and examples exactly.
-
-### Purpose / Big Picture
-
-Explain what the user gets after this change and how they can see it working. State the user‑visible behaviors that will be enabled.
-
-### Progress
-
-Use checkbox lists to summarize granular steps. Record every stopping point here. Use timestamps to measure progress.
-
-```
-- [x] (2025-10-01 13:00Z) Completed example step.
-- [ ] Incomplete example step.
-- [ ] Partially done (completed: X; remaining: Y).
-```
-
-### Surprises & Discoveries
-
-Record unexpected behaviors, bugs, optimizations, or insights discovered during implementation. Provide brief evidence.
-
-```
-- Observation: …
-- Evidence: …
-```
-
-### Decision Log
-
-Record every decision made during the work:
-
-```
-- Decision: …
-- Rationale: …
-- Date/Author: …
-```
-
-### Outcomes & Retrospective
-
-At major milestones or upon completion, summarize results, gaps, and lessons learned. Compare outcomes against the original Purpose.
-
-### Context and Orientation
-
-Describe the current state relevant to the task, as if the reader knows nothing. Name key files and modules with full paths. Define any non‑obvious terms you will use. Do not reference prior plans.
-
-### Plan of Work
-
-Describe in prose the order in which sections will be edited and added. For each edit, name the file and location (function, module) and what will be inserted or changed. Keep it specific and minimal.
-
-### Concrete Steps
-
-State the exact commands to run and where (working directory). When commands generate output, show brief expected transcriptions for comparison. Update this section as work progresses.
-
-### Validation and Acceptance
-
-Describe how to start or use the system and what to observe. Express acceptance criteria as behaviors with specific inputs and outputs. If tests are involved, state "run and expect to pass; new tests fail before the change and pass after."
-
-### Idempotence and Recovery
-
-If steps can be safely repeated, state so. If steps have risks, provide safe retry or rollback paths. Keep the environment clean after completion.
-
-### Artifacts and Notes
-
-Include the most important transcriptions, diffs, or snippets as indented examples. Keep it concise and focused on evidence of success.
-
-### Interfaces and Dependencies
-
-Be specific. Name the libraries, modules, and services to use and why. Specify the types, traits/interfaces, and function signatures that must exist.
-
-Example:
-In `crates/foo/planner.rs`, define:
-
-```rust
-pub trait Planner {
-    fn plan(&self, observed: &Observed) -> Vec<PlanStep>;
-}
-```
-
-### Prototyping Milestones (Optional)
-
-When reducing risk for larger changes, prototyping milestones are allowed. Keep prototypes additive and testable. Clearly mark the scope as "prototyping". Describe how to run and observe results. State criteria for promoting or abandoning the prototype.
-
-PLANEOF
-
-  log "创建: $PLAN_FILE"
+parse_tool_list() {
+  local csv="$1"
+  local old_ifs="$IFS"
+  local part
+  IFS=','
+  for part in $csv; do
+    IFS="$old_ifs"
+    if [[ -z "$part" ]]; then
+      continue
+    fi
+    if [[ "$part" == "all" ]]; then
+      INSTALL_ALL=1
+      continue
+    fi
+    validate_tool "$part"
+    append_unique_tool "$part"
+    IFS=','
+  done
+  IFS="$old_ifs"
 }
 
-# --- 主逻辑 ---
-main() {
-  local tool="codex"
-
-  # 解析参数
+parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --tool|-t)
-        tool="${2:-codex}"
+        if [[ $# -lt 2 ]]; then
+          echo "Missing value for $1" >&2
+          usage
+          exit 1
+        fi
+        parse_tool_list "$2"
         shift 2
+        ;;
+      --all)
+        INSTALL_ALL=1
+        shift
+        ;;
+      --dry-run)
+        DRY_RUN=1
+        shift
+        ;;
+      --force-managed)
+        FORCE_MANAGED=1
+        shift
+        ;;
+      --print-profile)
+        PRINT_PROFILE=1
+        shift
         ;;
       --help|-h)
         usage
+        exit 0
         ;;
-      codex|claude|copilot|opencode)
-        tool="$1"
+      codex|claude|gemini|opencode|copilot)
+        append_unique_tool "$1"
         shift
         ;;
       *)
-        echo "未知选项: $1"
+        echo "Unknown argument: $1" >&2
         usage
+        exit 1
         ;;
     esac
   done
 
-  log "开始为 $tool 设置 Brainstorming + ExecPlan..."
+  if [[ "$INSTALL_ALL" -eq 1 ]]; then
+    REQUESTED_TOOLS=("${ALL_TOOLS[@]}")
+  fi
 
-  # 1. 处理项目根目录的配置文件
-  local tool_files
-  tool_files=$(get_tool_files "$tool")
-  local files=($tool_files)
-  for file in "${files[@]}"; do
-    local dir
-    dir=$(dirname "$file")
-    [[ -n "$dir" && "$dir" != "." ]] && ensure_dir "$dir"
+  if [[ "${#REQUESTED_TOOLS[@]}" -eq 0 ]]; then
+    REQUESTED_TOOLS=("${ALL_TOOLS[@]}")
+  fi
+}
 
-    if [[ ! -f "$file" ]]; then
-      cat > "$file" << HEADER
+ensure_dir() {
+  local dir="$1"
+  if [[ -z "$dir" || "$dir" == "." ]]; then
+    return
+  fi
+  if [[ -d "$dir" ]]; then
+    return
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "mkdir -p $dir"
+    return
+  fi
+  mkdir -p "$dir"
+}
+
+managed_marker_for() {
+  local path="$1"
+  case "$path" in
+    *.md) echo "<!-- $MANAGED_MARKER -->" ;;
+    *.toml|*.sh) echo "# $MANAGED_MARKER" ;;
+    *) echo "" ;;
+  esac
+}
+
+path_supports_force_overwrite() {
+  local path="$1"
+  case "$path" in
+    .claude/settings.json|opencode.json) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+write_content() {
+  local path="$1"
+  local content="$2"
+  local dir
+  dir="$(dirname "$path")"
+  ensure_dir "$dir"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "write $path"
+    return
+  fi
+
+  printf '%s\n' "$content" > "$path"
+}
+
+record_created() {
+  CREATED_FILES+=("$1")
+}
+
+record_updated() {
+  UPDATED_FILES+=("$1")
+}
+
+record_appended() {
+  APPENDED_FILES+=("$1")
+}
+
+record_skipped() {
+  SKIPPED_FILES+=("$1")
+}
+
+write_or_update_file() {
+  local path="$1"
+  local content="$2"
+  local marker
+  marker="$(managed_marker_for "$path")"
+
+  if [[ ! -f "$path" ]]; then
+    write_content "$path" "$content"
+    record_created "$path"
+    return
+  fi
+
+  if [[ "$(cat "$path")" == "$content" ]]; then
+    record_skipped "$path (unchanged)"
+    return
+  fi
+
+  if [[ -n "$marker" ]] && grep -Fq "$marker" "$path"; then
+    write_content "$path" "$content"
+    record_updated "$path"
+    return
+  fi
+
+  if [[ "$FORCE_MANAGED" -eq 1 ]] && path_supports_force_overwrite "$path"; then
+    write_content "$path" "$content"
+    record_updated "$path"
+    return
+  fi
+
+  record_skipped "$path (existing unmanaged file)"
+}
+
+append_to_existing_file() {
+  local path="$1"
+  local block="$2"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "append $path"
+    record_appended "$path"
+    return
+  fi
+  printf '\n%s\n' "$block" >> "$path"
+  record_appended "$path"
+}
+
+render_agents_md() {
+  cat <<EOF
+<!-- $MANAGED_MARKER -->
 # Project Instructions
 
-## Brainstorming Ideas Into Designs (Pre‑Implementation)
+This repository is ExecPlan-first.
 
-$INTRO_CONTENT
+## Canonical Source
 
-## ExecPlans (Design → Implementation)
+- \`AGENTS.md\` is the canonical project entrypoint.
+- \`.agents/PLANS.md\` is the canonical ExecPlan specification.
+- Store plan files in \`.agents/exec-plans/\`.
 
-$EXECPLAN_CONTENT
-HEADER
-      log "创建: $file"
-    elif has_marker "$file"; then
-      log "跳过: $file (已包含 Brainstorming)"
-    elif should_replace "$file"; then
-      cat > "$file" << HEADER
-# Project Instructions
+## Workflow
 
-## Brainstorming Ideas Into Designs (Pre‑Implementation)
+- For multi-step work, significant refactors, or any task where design decisions materially affect implementation, create or update an ExecPlan before code edits.
+- If your tool supports a native plans directory or equivalent, point it at \`.agents/exec-plans/\`.
+- If your tool does not provide a native planning entrypoint, use the \`brainstorming\` skill in \`.agents/skills/brainstorming/SKILL.md\` before implementation.
+- Keep tool-specific bridge files short. They should direct the tool back to this canonical source instead of duplicating the entire workflow.
+EOF
+}
 
-$INTRO_CONTENT
+render_agents_bridge_append() {
+  cat <<EOF
+<!-- $BRIDGE_MARKER -->
+## OpenExecPlans Bridge
 
-## ExecPlans (Design → Implementation)
+- Canonical ExecPlan rules live in \`.agents/PLANS.md\`.
+- Store plan files in \`.agents/exec-plans/\`.
+- If this tool does not provide a native planning directory, use the \`brainstorming\` skill in \`.agents/skills/brainstorming/SKILL.md\` before implementation.
+EOF
+}
 
-$EXECPLAN_CONTENT
-HEADER
-      log "替换: $file (检测到文件被覆盖，已恢复)"
-    else
-      cat >> "$file" << APPEND
+render_plans_md() {
+  cat <<EOF
+<!-- $MANAGED_MARKER -->
+# ExecPlans
 
+Use ExecPlans for complex features, significant refactors, and any multi-step task where design choices matter.
+
+Repository convention: store ExecPlan files in \`.agents/exec-plans/\` using date-prefixed names such as \`.agents/exec-plans/2026-04-22-add-checker.md\`.
+
+If a plan is first produced inline in chat, materialize it in \`.agents/exec-plans/\` before repository code edits.
+
+## Requirements
+
+Every ExecPlan must:
+
+- Explain the user-visible purpose of the work.
+- Be self-contained enough that a new contributor can continue from the plan and working tree.
+- Be maintained as a living document.
+- Include concrete file paths, validation steps, and decisions.
+
+## Required Sections
+
+- \`Purpose / Big Picture\`
+- \`Progress\`
+- \`Surprises & Discoveries\`
+- \`Decision Log\`
+- \`Outcomes & Retrospective\`
+- \`Context and Orientation\`
+- \`Plan of Work\`
+- \`Concrete Steps\`
+- \`Validation and Acceptance\`
+- \`Idempotence and Recovery\`
+- \`Artifacts and Notes\`
+- \`Interfaces and Dependencies\`
+
+## Skeleton
+
+\`\`\`md
+# <Short action-oriented title>
+
+This ExecPlan is a living document. Keep \`Progress\`, \`Surprises & Discoveries\`, \`Decision Log\`, and \`Outcomes & Retrospective\` current as work proceeds.
+
+This plan follows \`.agents/PLANS.md\`.
+
+## Purpose / Big Picture
+
+Explain what changes for users or contributors after the work lands.
+
+## Progress
+
+- [ ] Create or update this plan before code edits.
+- [ ] Implement the planned work.
+- [ ] Validate the result.
+
+## Surprises & Discoveries
+
+- Observation:
+  Evidence:
+
+## Decision Log
+
+- Decision:
+  Rationale:
+  Date/Author:
+
+## Outcomes & Retrospective
+
+Summarize shipped behavior, remaining gaps, and lessons learned.
+
+## Context and Orientation
+
+Describe the current repository state and key files.
+
+## Plan of Work
+
+Describe the sequence of edits in prose.
+
+## Concrete Steps
+
+List exact commands to run from the repository root.
+
+## Validation and Acceptance
+
+Describe observable pass criteria.
+
+## Idempotence and Recovery
+
+Explain safe reruns and rollback expectations.
+
+## Artifacts and Notes
+
+Keep short evidence snippets here.
+
+## Interfaces and Dependencies
+
+Describe touched interfaces, config files, and external tool assumptions.
+\`\`\`
+EOF
+}
+
+render_execplans_readme() {
+  cat <<EOF
+<!-- $MANAGED_MARKER -->
+# ExecPlan Directory
+
+This is the canonical directory for ExecPlan files in this repository.
+
+Use date-prefixed file names:
+
+- \`.agents/exec-plans/YYYY-MM-DD-<topic>.md\`
+
+When a plan starts in chat first, materialize it here before code edits.
+EOF
+}
+
+render_brainstorming_skill() {
+  cat <<EOF
 ---
+name: brainstorming
+description: "Use this before implementation when a task needs design clarification or when your tool lacks a native plans directory."
+---
+<!-- $MANAGED_MARKER -->
 
-## Brainstorming Ideas Into Designs (Pre‑Implementation)
+# Brainstorming Ideas Into Designs
 
-$INTRO_CONTENT
+Use this skill before implementation when the task involves design choices, unclear requirements, or a tool workflow that lacks a native plan directory.
 
-## ExecPlans (Design → Implementation)
+## Goals
 
-$EXECPLAN_CONTENT
-APPEND
-      log "追加: $file"
+- Understand the current project context before proposing implementation.
+- Ask one focused clarification question at a time when information is missing.
+- Present two or three approaches with trade-offs when there is more than one reasonable path.
+- Get explicit user approval before implementation starts.
+
+## Workflow
+
+1. Inspect the current repository state first.
+2. Clarify the goal and constraints.
+3. Present a concise recommended design.
+4. After approval, create or update an ExecPlan in \`.agents/exec-plans/\`.
+5. Implement against that ExecPlan.
+
+## Output Expectations
+
+- Keep questions narrow and sequential.
+- Prefer multiple choice when it reduces effort for the user.
+- Do not write code before the design is accepted.
+- When the design is accepted, point back to \`.agents/PLANS.md\` and the canonical plan directory.
+EOF
+}
+
+render_claude_md() {
+  cat <<EOF
+<!-- $MANAGED_MARKER -->
+# Claude Code Bridge
+
+This repository is ExecPlan-first.
+
+- Canonical workflow rules live in \`AGENTS.md\`.
+- Canonical ExecPlan rules live in \`.agents/PLANS.md\`.
+- Store plan files in \`.agents/exec-plans/\`.
+
+Project Claude settings should point \`plansDirectory\` at \`.agents/exec-plans\`.
+EOF
+}
+
+render_claude_settings_json() {
+  cat <<EOF
+{
+  "plansDirectory": ".agents/exec-plans"
+}
+EOF
+}
+
+render_codex_config_toml() {
+  cat <<EOF
+# $MANAGED_MARKER
+developer_instructions = """
+This repository is ExecPlan-first.
+
+Canonical source files:
+- AGENTS.md
+- .agents/PLANS.md
+- .agents/exec-plans/
+
+If work is multi-step or design-sensitive, create or update an ExecPlan in .agents/exec-plans/ before code changes.
+If the environment lacks a native planning directory, use the brainstorming skill in .agents/skills/brainstorming/SKILL.md before implementation.
+"""
+
+[features]
+collaboration_modes = true
+EOF
+}
+
+render_gemini_md() {
+  cat <<EOF
+<!-- $MANAGED_MARKER -->
+# Gemini Bridge
+
+This repository is ExecPlan-first.
+
+- Read \`AGENTS.md\` as the canonical project entrypoint.
+- Read \`.agents/PLANS.md\` for the full ExecPlan workflow.
+- Store plan files in \`.agents/exec-plans/\`.
+- Use the \`brainstorming\` skill in \`.agents/skills/brainstorming/SKILL.md\` before implementation when design work is needed.
+EOF
+}
+
+render_opencode_json() {
+  cat <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "instructions": ["AGENTS.md", ".agents/PLANS.md"]
+}
+EOF
+}
+
+render_copilot_instructions_md() {
+  cat <<EOF
+<!-- $MANAGED_MARKER -->
+# Copilot Agent Bridge
+
+This repository is ExecPlan-first.
+
+- Canonical workflow rules live in \`AGENTS.md\`.
+- Canonical ExecPlan rules live in \`.agents/PLANS.md\`.
+- Store plan files in \`.agents/exec-plans/\`.
+- For multi-step work, create or update an ExecPlan before code edits.
+- If planning help is needed, follow the design-first workflow described in the \`brainstorming\` skill at \`.agents/skills/brainstorming/SKILL.md\`.
+EOF
+}
+
+list_target_files_for_tool() {
+  local tool="$1"
+  case "$tool" in
+    codex)
+      echo ".codex/config.toml"
+      ;;
+    claude)
+      echo "CLAUDE.md .claude/settings.json"
+      ;;
+    gemini)
+      echo "GEMINI.md"
+      ;;
+    opencode)
+      echo "opencode.json"
+      ;;
+    copilot)
+      echo ".github/copilot-instructions.md"
+      ;;
+  esac
+}
+
+print_profile() {
+  local tool
+  local files
+  echo "Selected tools: ${REQUESTED_TOOLS[*]}"
+  echo "Canonical files:"
+  echo "  - AGENTS.md"
+  echo "  - .agents/PLANS.md"
+  echo "  - .agents/exec-plans/README.md"
+  echo "  - .agents/skills/brainstorming/SKILL.md"
+  echo "Tool bridge files:"
+  for tool in "${REQUESTED_TOOLS[@]}"; do
+    files="$(list_target_files_for_tool "$tool")"
+    if [[ -n "$files" ]]; then
+      echo "  - [$tool] $files"
     fi
   done
+}
 
-  # 2. 创建 .agent/AGENTS.md (仅 Codex 需要)
-  if [[ "$tool" == "codex" ]]; then
-    ensure_dir "$AGENT_DIR"
-    local agent_file="$AGENT_DIR/AGENTS.md"
+install_agents_md() {
+  local path="AGENTS.md"
+  local bridge_block
+  local desired
+  bridge_block="$(render_agents_bridge_append)"
+  desired="$(render_agents_md)"
 
-    if [[ ! -f "$agent_file" ]]; then
-      cat > "$agent_file" << AGENTS
-# Repo Agents Instructions
+  if [[ ! -f "$path" ]]; then
+    write_content "$path" "$desired"
+    record_created "$path"
+    return
+  fi
 
-This repository uses a two‑phase workflow:
+  if [[ "$(cat "$path")" == "$desired" ]]; then
+    record_skipped "$path (unchanged)"
+    return
+  fi
 
-1. Brainstorming Ideas Into Designs (pre‑implementation)
-2. ExecPlans (design → implementation)
+  if grep -Fq "<!-- $MANAGED_MARKER -->" "$path"; then
+    write_content "$path" "$desired"
+    record_updated "$path"
+    return
+  fi
 
-## 1. Brainstorming Ideas Into Designs (Pre‑Implementation Phase)
+  if grep -Fq "$BRIDGE_MARKER" "$path" || grep -Fq ".agents/PLANS.md" "$path"; then
+    record_skipped "$path (existing unmanaged file already references ExecPlans)"
+    return
+  fi
 
-$INTRO_CONTENT
+  append_to_existing_file "$path" "$bridge_block"
+}
 
-When starting ANY new task (feature, refactor, config, documentation structure, etc.) you MUST:
+install_canonical_files() {
+  install_agents_md
+  write_or_update_file ".agents/PLANS.md" "$(render_plans_md)"
+  write_or_update_file ".agents/exec-plans/README.md" "$(render_execplans_readme)"
+  write_or_update_file ".agents/skills/brainstorming/SKILL.md" "$(render_brainstorming_skill)"
+}
 
-1. Explore the current project context (files, docs, recent changes).
-2. Ask clarifying questions one at a time until the goal and constraints are clear.
-3. Propose one or more design options with trade‑offs and a recommendation.
-4. Present a concise design/spec and get explicit user approval before any implementation.
+install_tool_codex() {
+  write_or_update_file ".codex/config.toml" "$(render_codex_config_toml)"
+}
 
-## 2. ExecPlans (Design → Implementation Phase)
+install_tool_claude() {
+  write_or_update_file "CLAUDE.md" "$(render_claude_md)"
+  write_or_update_file ".claude/settings.json" "$(render_claude_settings_json)"
+}
 
-When writing complex features or significant refactors, AFTER the design has been approved,
-use an ExecPlan (as described in .agent/PLANS.md) from design to implementation.
+install_tool_gemini() {
+  write_or_update_file "GEMINI.md" "$(render_gemini_md)"
+}
 
-ExecPlans are living documents that:
-- Are fully self‑contained (no external memory beyond the working tree and the plan file itself).
-- Contain milestones, validation steps, and logs of decisions.
-- Allow a coding agent to continue work or restart from ONLY the ExecPlan + repo state.
+install_tool_opencode() {
+  write_or_update_file "opencode.json" "$(render_opencode_json)"
+}
 
-Agents MUST:
-- Always follow the Brainstorming phase BEFORE creating or modifying ExecPlans.
-- Then follow the ExecPlan rules in .agent/PLANS.md _to the letter_ during implementation.
-AGENTS
-      log "创建: $agent_file"
-    elif has_marker "$agent_file"; then
-      log "跳过: $agent_file (已包含 Brainstorming)"
-    elif should_replace "$agent_file"; then
-      cat > "$agent_file" << AGENTS
-# Repo Agents Instructions
+install_tool_copilot() {
+  write_or_update_file ".github/copilot-instructions.md" "$(render_copilot_instructions_md)"
+}
 
-This repository uses a two‑phase workflow:
+install_tool() {
+  local tool="$1"
+  case "$tool" in
+    codex) install_tool_codex ;;
+    claude) install_tool_claude ;;
+    gemini) install_tool_gemini ;;
+    opencode) install_tool_opencode ;;
+    copilot) install_tool_copilot ;;
+  esac
+}
 
-1. Brainstorming Ideas Into Designs (pre‑implementation)
-2. ExecPlans (design → implementation)
+print_summary() {
+  local file
 
-## 1. Brainstorming Ideas Into Designs (Pre‑Implementation Phase)
+  echo
+  log "Summary"
 
-$INTRO_CONTENT
+  if [[ "${#CREATED_FILES[@]}" -gt 0 ]]; then
+    echo "Created:"
+    for file in "${CREATED_FILES[@]}"; do
+      echo "  - $file"
+    done
+  fi
 
-When starting ANY new task (feature, refactor, config, documentation structure, etc.) you MUST:
+  if [[ "${#UPDATED_FILES[@]}" -gt 0 ]]; then
+    echo "Updated:"
+    for file in "${UPDATED_FILES[@]}"; do
+      echo "  - $file"
+    done
+  fi
 
-1. Explore the current project context (files, docs, recent changes).
-2. Ask clarifying questions one at a time until the goal and constraints are clear.
-3. Propose one or more design options with trade‑offs and a recommendation.
-4. Present a concise design/spec and get explicit user approval before any implementation.
+  if [[ "${#APPENDED_FILES[@]}" -gt 0 ]]; then
+    echo "Appended:"
+    for file in "${APPENDED_FILES[@]}"; do
+      echo "  - $file"
+    done
+  fi
 
-## 2. ExecPlans (Design → Implementation Phase)
+  if [[ "${#SKIPPED_FILES[@]}" -gt 0 ]]; then
+    echo "Skipped:"
+    for file in "${SKIPPED_FILES[@]}"; do
+      echo "  - $file"
+    done
+  fi
 
-When writing complex features or significant refactors, AFTER the design has been approved,
-use an ExecPlan (as described in .agent/PLANS.md) from design to implementation.
+  if [[ "${#WARNINGS[@]}" -gt 0 ]]; then
+    echo "Warnings:"
+    for file in "${WARNINGS[@]}"; do
+      echo "  - $file"
+    done
+  fi
+}
 
-ExecPlans are living documents that:
-- Are fully self‑contained (no external memory beyond the working tree and the plan file itself).
-- Contain milestones, validation steps, and logs of decisions.
-- Allow a coding agent to continue work or restart from ONLY the ExecPlan + repo state.
+main() {
+  parse_args "$@"
 
-Agents MUST:
-- Always follow the Brainstorming phase BEFORE creating or modifying ExecPlans.
-- Then follow the ExecPlan rules in .agent/PLANS.md _to the letter_ during implementation.
-AGENTS
-      log "替换: $agent_file (检测到文件被覆盖，已恢复)"
-    else
-      cat >> "$agent_file" << AGENTS
-
----
-
-# Repo Agents Instructions
-
-This repository uses a two‑phase workflow:
-
-1. Brainstorming Ideas Into Designs (pre‑implementation)
-2. ExecPlans (design → implementation)
-
-## 1. Brainstorming Ideas Into Designs (Pre‑Implementation Phase)
-
-$INTRO_CONTENT
-
-When starting ANY new task (feature, refactor, config, documentation structure, etc.) you MUST:
-
-1. Explore the current project context (files, docs, recent changes).
-2. Ask clarifying questions one at a time until the goal and constraints are clear.
-3. Propose one or more design options with trade‑offs and a recommendation.
-4. Present a concise design/spec and get explicit user approval before any implementation.
-
-## 2. ExecPlans (Design → Implementation Phase)
-
-When writing complex features or significant refactors, AFTER the design has been approved,
-use an ExecPlan (as described in .agent/PLANS.md) from design to implementation.
-
-ExecPlans are living documents that:
-- Are fully self‑contained (no external memory beyond the working tree and the plan file itself).
-- Contain milestones, validation steps, and logs of decisions.
-- Allow a coding agent to continue work or restart from ONLY the ExecPlan + repo state.
-
-Agents MUST:
-- Always follow the Brainstorming phase BEFORE creating or modifying ExecPlans.
-- Then follow the ExecPlan rules in .agent/PLANS.md _to the letter_ during implementation.
-AGENTS
-      log "追加: $agent_file"
+  if [[ "$PRINT_PROFILE" -eq 1 ]]; then
+    print_profile
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      exit 0
     fi
   fi
 
-  # 3. 创建/更新 PLANS.md 模板
-  if [[ -f "$PLAN_FILE" ]] && grep -q "$PLAN_MARKER" "$PLAN_FILE"; then
-    log "跳过: $PLAN_FILE (已是最新版模板)"
-  else
-    create_plan_template
-  fi
+  log "Installing canonical ExecPlan workflow"
+  install_canonical_files
 
-  echo ""
-  log "完成！已为 $tool 配置 Brainstorming + ExecPlan"
-  echo ""
-  echo "创建/更新的文件:"
-  echo "  - ${files[*]}"
-  [[ "$tool" == "codex" ]] && echo "  - $AGENT_DIR/AGENTS.md"
-  echo "  - $PLAN_FILE"
+  local tool
+  for tool in "${REQUESTED_TOOLS[@]}"; do
+    log "Installing bridge for $tool"
+    install_tool "$tool"
+  done
+
+  print_summary
 }
 
 main "$@"
